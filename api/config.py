@@ -8,8 +8,8 @@ class Settings(BaseSettings):
     openai_api_key: str
     llm_model: str = "gpt-4o"
     llm_mini_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dim: int = 1536
+    embedding_model: str = "text-embedding-3-large"
+    embedding_dim: int = 3072
 
     # Zendesk
     zendesk_api_key: str
