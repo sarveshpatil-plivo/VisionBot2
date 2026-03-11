@@ -21,6 +21,11 @@ class Settings(BaseSettings):
     qdrant_problems_collection: str = "ticket_problems"
     qdrant_resolutions_collection: str = "ticket_resolutions"
 
+    # Atlassian (Jira + Confluence)
+    atlassian_base_url: str = ""
+    atlassian_email: str = ""
+    atlassian_api_key: str = ""
+
     # API
     api_secret_token: str
     frontend_url: str = "http://localhost:5173"
@@ -34,6 +39,7 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()

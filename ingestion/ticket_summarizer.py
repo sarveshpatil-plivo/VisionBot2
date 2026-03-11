@@ -15,7 +15,7 @@ from openai import AsyncOpenAI
 logger = logging.getLogger(__name__)
 
 CACHE_FILE = Path("summaries_cache.jsonl")
-BATCH_SIZE = 20  # Concurrent GPT-4o calls
+BATCH_SIZE = 50  # Concurrent GPT-4o-mini calls
 
 SYSTEM_PROMPT = """You are a technical support analyst. Given a Zendesk ticket conversation,
 extract structured information and return ONLY a JSON object with these exact fields:
@@ -86,19 +86,30 @@ class TicketSummarizer:
 
         text = _build_ticket_text(ticket)
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Analyze this ticket:\n\n{text}"},
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
-            summary = json.loads(response.choices[0].message.content)
-        except Exception as e:
-            logger.error(f"Summarization failed for ticket {ticket_id}: {e}")
+        summary = None
+        for attempt in range(5):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": f"Analyze this ticket:\n\n{text}"},
+                    ],
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                )
+                summary = json.loads(response.choices[0].message.content)
+                break
+            except Exception as e:
+                if "rate_limit" in str(e).lower() or "429" in str(e):
+                    wait = 2 ** attempt
+                    logger.warning(f"Rate limited — waiting {wait}s (attempt {attempt+1})")
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(f"Summarization failed for ticket {ticket_id}: {e}")
+                    break
+
+        if summary is None:
             summary = {
                 "problem_description": ticket.get("subject"),
                 "root_cause": None,
