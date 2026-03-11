@@ -17,6 +17,29 @@ logger = logging.getLogger(__name__)
 CACHE_FILE = Path("summaries_cache.jsonl")
 BATCH_SIZE = 50  # Concurrent GPT-4o-mini calls
 
+
+def get_cache_file(year: int = None) -> Path:
+    """Return year-specific cache file path for parallel summarization."""
+    if year:
+        return Path(f"summaries_cache_{year}.jsonl")
+    return CACHE_FILE
+
+
+def load_all_caches() -> dict[str, dict]:
+    """Merge all summaries_cache*.jsonl files into one dict keyed by ticket_id."""
+    cache = {}
+    cache_files = list(Path(".").glob("summaries_cache*.jsonl"))
+    for path in sorted(cache_files):
+        if path.exists():
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        entry = json.loads(line)
+                        cache[str(entry["ticket_id"])] = entry
+    logger.info(f"Loaded {len(cache)} cached summaries from {len(cache_files)} cache file(s)")
+    return cache
+
 SYSTEM_PROMPT = """You are a technical support analyst. Given a Zendesk ticket conversation,
 extract structured information and return ONLY a JSON object with these exact fields:
 
@@ -51,31 +74,34 @@ def _build_ticket_text(ticket: dict) -> str:
     return "\n".join(parts)
 
 
-def _load_cache() -> dict[str, dict]:
+def _load_cache(cache_file: Path = None) -> dict[str, dict]:
     """Load existing summaries cache keyed by ticket_id."""
+    path = cache_file or CACHE_FILE
     cache = {}
-    if CACHE_FILE.exists():
-        with open(CACHE_FILE) as f:
+    if path.exists():
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if line:
                     entry = json.loads(line)
                     cache[str(entry["ticket_id"])] = entry
-    logger.info(f"Loaded {len(cache)} cached summaries")
+    logger.info(f"Loaded {len(cache)} cached summaries from {path.name}")
     return cache
 
 
-def _append_cache(entry: dict):
+def _append_cache(entry: dict, cache_file: Path = None):
     """Append a single summary to cache file."""
-    with open(CACHE_FILE, "a") as f:
+    path = cache_file or CACHE_FILE
+    with open(path, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
 class TicketSummarizer:
-    def __init__(self, api_key: str, model: str = "gpt-4o"):
+    def __init__(self, api_key: str, model: str = "gpt-4o", year: int = None):
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = model
-        self.cache = _load_cache()
+        self.cache_file = get_cache_file(year)
+        self.cache = _load_cache(self.cache_file)
 
     async def _summarize_one(self, ticket: dict) -> dict:
         """Summarize a single ticket using GPT-4o."""
@@ -123,7 +149,7 @@ class TicketSummarizer:
             }
 
         entry = {"ticket_id": ticket_id, **summary}
-        _append_cache(entry)
+        _append_cache(entry, self.cache_file)
         self.cache[ticket_id] = entry
         return entry
 

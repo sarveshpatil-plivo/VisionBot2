@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.config import settings
 from ingestion.zendesk_extractor import ZendeskExtractor
-from ingestion.ticket_summarizer import TicketSummarizer
+from ingestion.ticket_summarizer import TicketSummarizer, load_all_caches
 from ingestion.chunker import chunk_tickets
 from ingestion.embedder import Embedder
 from ingestion.indexer import init_collections, upsert_chunks, assign_clusters
@@ -86,7 +86,7 @@ def _parse_since(since_str: str) -> str:
     return dt.isoformat()
 
 
-async def run(incremental: bool = False, since_date: str = None, fetch_only: bool = False, stop_after_summarize: bool = False):
+async def run(incremental: bool = False, since_date: str = None, fetch_only: bool = False, stop_after_summarize: bool = False, summarize_year: int = None):
     mode = "incremental" if incremental else (f"since {since_date}" if since_date else "full")
     logger.info(f"Starting ingestion pipeline — mode: {mode}")
 
@@ -149,20 +149,25 @@ async def run(incremental: bool = False, since_date: str = None, fetch_only: boo
         logger.info("--fetch-only flag set — stopping after fetch. Run without --fetch-only to continue.")
         return
 
-    summarizer = TicketSummarizer(api_key=settings.openai_api_key, model=settings.llm_mini_model)
-    embedder = Embedder(api_key=settings.openai_api_key, dense_model=settings.embedding_model)
-    qdrant = QdrantClient(path=settings.qdrant_path)
-    init_collections(qdrant, dim=settings.embedding_dim)
+    summarizer = TicketSummarizer(api_key=settings.openai_api_key, model=settings.llm_mini_model, year=summarize_year)
 
     # ── Step 2: Summarize ────────────────────────────────────────────────────
-    logger.info("Step 2: Summarizing tickets with GPT-4o-mini...")
-    summaries_list = await summarizer.summarize_batch(raw_tickets)
+    if summarize_year:
+        tickets_to_summarize = [t for t in raw_tickets if t.get("updated_at", "")[:4] == str(summarize_year)]
+        logger.info(f"Step 2: Summarizing {len(tickets_to_summarize)} tickets for year {summarize_year}...")
+    else:
+        tickets_to_summarize = raw_tickets
+        logger.info("Step 2: Summarizing tickets with GPT-4o-mini...")
+    summaries_list = await summarizer.summarize_batch(tickets_to_summarize)
     summaries = {str(s["ticket_id"]): s for s in summaries_list}
     logger.info(f"Summarized {len(summaries)} tickets")
 
-    if stop_after_summarize:
-        logger.info("--stop-after-summarize flag set — stopping after summarization. Run without this flag to continue with embed + upsert.")
+    if stop_after_summarize or summarize_year:
+        logger.info("Stopping after summarization. Run without --summarize-year / --stop-after-summarize to continue.")
         return
+
+    # Merge all year-specific cache files for downstream steps
+    summaries = load_all_caches()
 
     # ── Step 3: Chunk ────────────────────────────────────────────────────────
     logger.info("Step 3: Chunking conversations...")
@@ -190,7 +195,11 @@ if __name__ == "__main__":
     fetch_only = "--fetch-only" in sys.argv
     stop_after_summarize = "--stop-after-summarize" in sys.argv
     since_date = None
+    summarize_year = None
     if "--since" in sys.argv:
         idx = sys.argv.index("--since")
         since_date = sys.argv[idx + 1]
-    asyncio.run(run(incremental=incremental, since_date=since_date, fetch_only=fetch_only, stop_after_summarize=stop_after_summarize))
+    if "--summarize-year" in sys.argv:
+        idx = sys.argv.index("--summarize-year")
+        summarize_year = int(sys.argv[idx + 1])
+    asyncio.run(run(incremental=incremental, since_date=since_date, fetch_only=fetch_only, stop_after_summarize=stop_after_summarize, summarize_year=summarize_year))
