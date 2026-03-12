@@ -56,16 +56,25 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Security(security))
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
-def log_query(session_id: str, question: str, confidence: float, latency_ms: int):
+def log_query(session_id: str, question: str, final_state: dict, latency_ms: int):
+    timings = final_state.get("timings") or {}
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "session_id": session_id,
         "question": question,
-        "confidence": confidence,
-        "latency_ms": latency_ms,
+        "intent": final_state.get("intent", ""),
+        "voice_related": final_state.get("is_voice_related", True),
+        "confidence": round(final_state.get("confidence_score", 0.0), 3),
+        "citations": len(final_state.get("citations") or []),
+        "retry_count": final_state.get("retry_count", 0),
+        "steps_ms": {k: v for k, v in timings.items() if v},
+        "total_ms": latency_ms,
     }
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
+    # Also print a compact summary to stdout for live monitoring
+    steps = " → ".join(f"{k.replace('_ms','')}:{v}" for k, v in timings.items() if v)
+    logger.info(f"[{session_id[:8]}] {question[:60]!r} | {steps} | total:{latency_ms}ms | conf:{entry['confidence']}")
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -97,6 +106,7 @@ async def query(
         # chat_history intentionally omitted — LangGraph MemorySaver preserves it across turns
         "metadata_filters": request.metadata_filters,
         "retry_count": 0,
+        "is_voice_related": True,
         "is_ambiguous": False,
         "awaiting_clarification": False,
         "confidence_score": 0.0,
@@ -148,12 +158,7 @@ async def query(
         }
         yield f"data: {json.dumps(metadata)}\n\n"
 
-        log_query(
-            request.session_id,
-            request.question,
-            final_state.get("confidence_score", 0.0),
-            latency_ms,
-        )
+        log_query(request.session_id, request.question, final_state, latency_ms)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

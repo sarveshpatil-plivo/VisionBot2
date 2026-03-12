@@ -11,7 +11,7 @@ const EXAMPLE_QUERIES = [
 ]
 
 export default function App() {
-  const sessionId = useSession()
+  const [sessionId, resetSession] = useSession()
   const { messages, isStreaming, sendMessage, sendFeedback } = useChat(sessionId)
   const [input, setInput] = useState('')
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -41,10 +41,18 @@ export default function App() {
         <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center text-white font-bold text-sm">
           S
         </div>
-        <div>
+        <div className="flex-1">
           <div className="font-semibold text-gray-900">SupportIQ</div>
           <div className="text-xs text-gray-500">Ticket intelligence · Internal</div>
         </div>
+        {messages.length > 0 && (
+          <button
+            onClick={resetSession}
+            className="text-sm text-gray-500 hover:text-gray-800 border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50 transition-colors"
+          >
+            New chat
+          </button>
+        )}
       </header>
 
       {/* Chat area */}

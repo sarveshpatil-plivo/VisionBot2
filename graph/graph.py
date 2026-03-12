@@ -76,6 +76,17 @@ def build_graph(
             qdrant=qdrant_client,
         )
 
+    def node_reject_off_topic(state):
+        """Short-circuit for non-voice queries — no retrieval, no LLM cost."""
+        return {
+            "answer": "I can only help with Plivo Voice API questions — things like call failures, SIP issues, WebRTC, audio quality, DTMF, call routing, and similar topics. What voice issue can I help you with?",
+            "citations": [],
+            "suggested_action": "",
+            "related_tickets": [],
+            "confidence_score": 0.0,
+            "confidence_factors": {},
+        }
+
     def node_ask_clarification(state):
         """Return the clarification question — graph pauses here for user input."""
         return {
@@ -92,6 +103,8 @@ def build_graph(
     # ── Routing functions ─────────────────────────────────────────────────────
 
     def route_after_classify(state) -> str:
+        if not state.get("is_voice_related", True):
+            return "reject_off_topic"
         if state.get("is_ambiguous") and not state.get("chat_history"):
             return "ask_clarification"
         return "generate_hyde"
@@ -107,6 +120,7 @@ def build_graph(
     graph = StateGraph(AgentState)
 
     graph.add_node("classify_intent", node_classify)
+    graph.add_node("reject_off_topic", node_reject_off_topic)
     graph.add_node("ask_clarification", node_ask_clarification)
     graph.add_node("generate_hyde", node_hyde)
     graph.add_node("retrieve", node_retrieve)
@@ -121,9 +135,11 @@ def build_graph(
 
     # Edges
     graph.add_conditional_edges("classify_intent", route_after_classify, {
+        "reject_off_topic": "reject_off_topic",
         "ask_clarification": "ask_clarification",
         "generate_hyde": "generate_hyde",
     })
+    graph.add_edge("reject_off_topic", END)
     graph.add_edge("ask_clarification", END)  # Pause — frontend sends follow-up
     graph.add_edge("generate_hyde", "retrieve")
     graph.add_edge("retrieve", "rerank")

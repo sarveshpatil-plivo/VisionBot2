@@ -8,7 +8,12 @@ node_modules/
 dist/
 .DS_Store
 summaries_cache.jsonl
+summaries_cache_voice.jsonl
 query_logs.jsonl
+feedback_logs.jsonl
+ingestion/voice_api_tickets.json
+ingestion/jira_checkpoint.jsonl
+frontend/.env.local
 *.egg-info/
 .pytest_cache/
 qdrant_data/

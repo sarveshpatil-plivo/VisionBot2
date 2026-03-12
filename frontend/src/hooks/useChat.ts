@@ -1,4 +1,5 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
+import { MESSAGES_KEY } from './useSession'
 
 const API_URL = '/api'
 const TOKEN = import.meta.env.VITE_API_TOKEN ?? ''
@@ -39,8 +40,36 @@ export interface Message {
 }
 
 export function useChat(sessionId: string) {
-  const [messages, setMessages] = useState<Message[]>([])
+  const [messages, setMessages] = useState<Message[]>(() => {
+    try {
+      const stored = localStorage.getItem(MESSAGES_KEY(sessionId))
+      if (stored) return (JSON.parse(stored) as Message[]).filter(m => !m.loading)
+    } catch {}
+    return []
+  })
   const [isStreaming, setIsStreaming] = useState(false)
+
+  // When sessionId changes (new chat), load messages for the new session
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(MESSAGES_KEY(sessionId))
+      if (stored) {
+        setMessages((JSON.parse(stored) as Message[]).filter(m => !m.loading))
+      } else {
+        setMessages([])
+      }
+    } catch {
+      setMessages([])
+    }
+  }, [sessionId])
+
+  // Persist messages to localStorage whenever they change (skip in-progress loading bubbles)
+  useEffect(() => {
+    const toSave = messages.filter(m => !m.loading)
+    if (toSave.length > 0) {
+      localStorage.setItem(MESSAGES_KEY(sessionId), JSON.stringify(toSave))
+    }
+  }, [messages, sessionId])
 
   const sendMessage = useCallback(async (question: string) => {
     if (isStreaming) return

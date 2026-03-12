@@ -6,6 +6,7 @@ All nodes receive the full AgentState and return a partial state update.
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -21,20 +22,27 @@ logger = logging.getLogger(__name__)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
-INTENT_PROMPT = """You are a query classifier for a technical support knowledge base.
+INTENT_PROMPT = """You are a query classifier for SupportIQ — an internal tool for Plivo support agents that answers questions exclusively about the Plivo Voice API.
 
 Classify the user's question and return ONLY a JSON object:
 {
+  "is_voice_related": true|false,
   "intent": "troubleshoot|explain|find-similar|summarize",
   "is_ambiguous": true|false,
   "clarification_question": "question to ask if ambiguous, else null"
 }
 
-Intent definitions:
-- troubleshoot: user has a problem and wants a fix
-- explain: user wants to understand how/why something works
+FIRST decide is_voice_related:
+- true ONLY if the query is about: voice calls, SIP, WebRTC, PSTN, call quality, audio, DTMF, call routing, IVR, Dial XML, caller ID, call recordings, voice SDK, outbound/inbound calls, call failures, Zentrunk, or other Plivo Voice API topics.
+- false for EVERYTHING else: greetings ("hi", "hello", "how are you"), small talk, SMS/messaging questions, billing, account issues, non-voice topics, random questions, jokes, or anything unrelated to the Plivo Voice API.
+
+If is_voice_related is false, set intent to "other" and is_ambiguous to false.
+
+If is_voice_related is true, classify intent:
+- troubleshoot: user has a voice problem and wants a fix
+- explain: user wants to understand how/why something works in voice
 - find-similar: user wants to see past tickets like this one
-- summarize: user wants an overview of a topic or trend
+- summarize: user wants an overview of a voice topic or trend
 
 Ambiguous = the query is too vague to retrieve relevant tickets without more context.
 Only mark ambiguous if a single clarifying question would significantly narrow the scope.
@@ -70,9 +78,10 @@ Return ONLY a JSON object:
 
 async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) -> dict:
     """Classify intent and detect ambiguity."""
+    t0 = time.monotonic()
     history_text = ""
     if state.get("chat_history"):
-        last = state["chat_history"][-3:]  # Last 3 turns for context
+        last = state["chat_history"][-3:]
         history_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in last)
 
     user_msg = state["question"]
@@ -94,12 +103,16 @@ async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) ->
         logger.error(f"Intent classification failed: {e}")
         result = {"intent": "troubleshoot", "is_ambiguous": False, "clarification_question": None}
 
-    logger.info(f"Intent: {result.get('intent')} | Ambiguous: {result.get('is_ambiguous')}")
+    is_voice = result.get("is_voice_related", True)
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.info(f"Voice-related: {is_voice} | Intent: {result.get('intent')} | Ambiguous: {result.get('is_ambiguous')} | {elapsed}ms")
     return {
+        "is_voice_related": is_voice,
         "intent": result.get("intent", "troubleshoot"),
         "is_ambiguous": result.get("is_ambiguous", False),
         "clarification_question": result.get("clarification_question"),
         "awaiting_clarification": result.get("is_ambiguous", False),
+        "timings": {**(state.get("timings") or {}), "classify_ms": elapsed},
     }
 
 
@@ -112,18 +125,20 @@ async def generate_hyde_node(
     model: str,
 ) -> dict:
     """Generate HyDE text and embed it. On retry, skip HyDE and embed raw query."""
+    t0 = time.monotonic()
     if state.get("retry_count", 0) > 0:
-        # Retry: embed raw question to get different retrieval signal
         hyde_text = state["question"]
     else:
         hyde_text = await generate_hyde(client, state["question"], model=model)
 
     dense, sparse = await embedder.embed_query_async(hyde_text)
-
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.info(f"HyDE + embed: {elapsed}ms")
     return {
         "hyde_text": hyde_text,
         "hyde_dense": dense,
         "hyde_sparse": sparse,
+        "timings": {**(state.get("timings") or {}), "hyde_ms": elapsed},
     }
 
 
@@ -131,6 +146,7 @@ async def generate_hyde_node(
 
 def retrieve_node(state: AgentState, qdrant: QdrantClient, top_k: int) -> dict:
     """Hybrid retrieval using HyDE embedding."""
+    t0 = time.monotonic()
     chunks = retrieve(
         client=qdrant,
         dense_vector=state["hyde_dense"],
@@ -138,19 +154,30 @@ def retrieve_node(state: AgentState, qdrant: QdrantClient, top_k: int) -> dict:
         top_k=top_k,
         filters=state.get("metadata_filters") or None,
     )
-    return {"retrieved_chunks": chunks}
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.info(f"Retrieve: {len(chunks)} chunks in {elapsed}ms")
+    return {
+        "retrieved_chunks": chunks,
+        "timings": {**(state.get("timings") or {}), "retrieve_ms": elapsed},
+    }
 
 
 # ── Node: rerank ─────────────────────────────────────────────────────────────
 
 def rerank_node(state: AgentState, top_n: int) -> dict:
     """Cross-encoder reranking of retrieved chunks."""
+    t0 = time.monotonic()
     reranked = rerank(
         query=state["question"],
         chunks=state["retrieved_chunks"],
         top_n=top_n,
     )
-    return {"reranked_chunks": reranked}
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.info(f"Rerank: {len(reranked)} chunks in {elapsed}ms")
+    return {
+        "reranked_chunks": reranked,
+        "timings": {**(state.get("timings") or {}), "rerank_ms": elapsed},
+    }
 
 
 # ── Node: compress ───────────────────────────────────────────────────────────
@@ -161,13 +188,19 @@ async def compress_node(
     model: str,
 ) -> dict:
     """Contextual compression of reranked chunks."""
+    t0 = time.monotonic()
     compressed = await compress_chunks(
         client=client,
         query=state["question"],
         chunks=state["reranked_chunks"],
         model=model,
     )
-    return {"compressed_chunks": compressed}
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.info(f"Compress: {elapsed}ms")
+    return {
+        "compressed_chunks": compressed,
+        "timings": {**(state.get("timings") or {}), "compress_ms": elapsed},
+    }
 
 
 # ── Node: check_confidence ───────────────────────────────────────────────────
@@ -210,8 +243,10 @@ def check_confidence_node(state: AgentState, threshold: float) -> dict:
                 pass
     recency = 1.0 - min(sum(ages) / max(len(ages), 1) / 365, 1.0) if ages else 0.7
 
-    # Factor 4: CSAT quality
-    csats = [c.get("csat_score") for c in chunks if c.get("csat_score") is not None]
+    # Factor 4: CSAT quality — Zendesk score is a string ("good"/"bad"/"offered"/"unoffered")
+    _CSAT_MAP = {"good": 5, "bad": 1, "offered": 3, "unoffered": 3}
+    csats_raw = [c.get("csat_score") for c in chunks if c.get("csat_score") is not None]
+    csats = [_CSAT_MAP.get(str(v).lower(), 3) for v in csats_raw]
     csat_norm = (sum(csats) / len(csats)) / 5.0 if csats else 0.7
 
     # Weighted composite
@@ -231,7 +266,11 @@ def check_confidence_node(state: AgentState, threshold: float) -> dict:
     }
 
     logger.info(f"Confidence score: {score} | Factors: {factors}")
-    return {"confidence_score": score, "confidence_factors": factors}
+    return {
+        "confidence_score": score,
+        "confidence_factors": factors,
+        "timings": {**(state.get("timings") or {}), "confidence_ms": 0},  # pure CPU, negligible
+    }
 
 
 # ── Node: generate_answer ────────────────────────────────────────────────────
@@ -243,6 +282,7 @@ async def generate_answer_node(
     qdrant: QdrantClient,
 ) -> dict:
     """CoT answer generation using compressed chunks as context."""
+    t0 = time.monotonic()
     chunks = state.get("compressed_chunks") or state.get("reranked_chunks", [])
 
     # Build context — handle both ticket chunks and docs chunks
@@ -328,12 +368,15 @@ async def generate_answer_node(
                 "excerpt": (c.get("compressed_text") or c.get("text", ""))[:200],
             })
 
+    elapsed = int((time.monotonic() - t0) * 1000)
+    logger.info(f"Answer generation: {elapsed}ms")
     return {
         "answer": answer_text,
         "citations": enriched_citations,
         "suggested_action": result.get("suggested_action", ""),
         "related_tickets": related,
         "chat_history": history,
+        "timings": {**(state.get("timings") or {}), "answer_ms": elapsed},
     }
 
 

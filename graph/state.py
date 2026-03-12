@@ -13,6 +13,7 @@ class AgentState(TypedDict):
 
     # Reasoning
     intent: str                     # troubleshoot | explain | find-similar | summarize
+    is_voice_related: bool          # False = off-topic, short-circuit before retrieval
     is_ambiguous: bool
     clarification_question: str     # Question to ask user when ambiguous
     awaiting_clarification: bool    # True when graph is paused for user input
@@ -36,3 +37,6 @@ class AgentState(TypedDict):
     suggested_action: str
     related_tickets: list[dict]     # Cluster siblings
     error: Optional[str]
+
+    # Observability
+    timings: dict[str, int]         # Step name → elapsed ms
