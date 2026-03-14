@@ -13,6 +13,7 @@ class AgentState(TypedDict):
 
     # Reasoning
     intent: str                     # troubleshoot | explain | find-similar | summarize
+    query_type: str                 # ticket_search | product_question
     is_voice_related: bool          # False = off-topic, short-circuit before retrieval
     is_ambiguous: bool
     clarification_question: str     # Question to ask user when ambiguous
@@ -31,8 +32,12 @@ class AgentState(TypedDict):
     confidence_score: float         # 0.0 - 1.0
     confidence_factors: dict        # Breakdown for display
 
+    # Live ticket injection (when user pastes a Zendesk URL)
+    injected_context: Optional[str]     # Full ticket thread fetched live from Zendesk
+
     # Output
     answer: str
+    reasoning: str
     citations: list[dict]
     suggested_action: str
     related_tickets: list[dict]     # Cluster siblings

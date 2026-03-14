@@ -13,6 +13,7 @@ from qdrant_client import QdrantClient
 
 from graph.state import AgentState
 from graph.nodes import (
+    fetch_ticket_context_node,
     classify_intent,
     generate_hyde_node,
     retrieve_node,
@@ -24,8 +25,6 @@ from graph.nodes import (
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 2
-
 
 def build_graph(
     openai_client: AsyncOpenAI,
@@ -36,6 +35,9 @@ def build_graph(
     """Build and compile the LangGraph agent."""
 
     # ── Wrap nodes with dependencies ─────────────────────────────────────────
+
+    async def node_fetch_ticket(state):
+        return await fetch_ticket_context_node(state, settings=settings)
 
     async def node_classify(state):
         return await classify_intent(
@@ -97,9 +99,6 @@ def build_graph(
             "related_tickets": [],
         }
 
-    def node_increment_retry(state):
-        return {"retry_count": (state.get("retry_count") or 0) + 1}
-
     # ── Routing functions ─────────────────────────────────────────────────────
 
     def route_after_classify(state) -> str:
@@ -109,16 +108,11 @@ def build_graph(
             return "ask_clarification"
         return "generate_hyde"
 
-    def route_after_confidence(state) -> str:
-        retry = state.get("retry_count") or 0
-        if state.get("confidence_score", 1.0) < settings.confidence_threshold and retry < MAX_RETRIES:
-            return "increment_retry"
-        return "generate_answer"
-
     # ── Build graph ───────────────────────────────────────────────────────────
 
     graph = StateGraph(AgentState)
 
+    graph.add_node("fetch_ticket_context", node_fetch_ticket)
     graph.add_node("classify_intent", node_classify)
     graph.add_node("reject_off_topic", node_reject_off_topic)
     graph.add_node("ask_clarification", node_ask_clarification)
@@ -127,11 +121,11 @@ def build_graph(
     graph.add_node("rerank", node_rerank)
     graph.add_node("compress", node_compress)
     graph.add_node("check_confidence", node_confidence)
-    graph.add_node("increment_retry", node_increment_retry)
     graph.add_node("generate_answer", node_answer)
 
-    # Entry
-    graph.set_entry_point("classify_intent")
+    # Entry: always check for Zendesk URL first (no-op if none present)
+    graph.set_entry_point("fetch_ticket_context")
+    graph.add_edge("fetch_ticket_context", "classify_intent")
 
     # Edges
     graph.add_conditional_edges("classify_intent", route_after_classify, {
@@ -140,16 +134,12 @@ def build_graph(
         "generate_hyde": "generate_hyde",
     })
     graph.add_edge("reject_off_topic", END)
-    graph.add_edge("ask_clarification", END)  # Pause — frontend sends follow-up
+    graph.add_edge("ask_clarification", END)
     graph.add_edge("generate_hyde", "retrieve")
     graph.add_edge("retrieve", "rerank")
     graph.add_edge("rerank", "compress")
     graph.add_edge("compress", "check_confidence")
-    graph.add_conditional_edges("check_confidence", route_after_confidence, {
-        "increment_retry": "increment_retry",
-        "generate_answer": "generate_answer",
-    })
-    graph.add_edge("increment_retry", "generate_hyde")  # Retry with incremented count
+    graph.add_edge("check_confidence", "generate_answer")  # Retry loop removed
     graph.add_edge("generate_answer", END)
 
     # Compile with in-memory checkpointer (sufficient for 20 users)
