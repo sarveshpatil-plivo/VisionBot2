@@ -6,17 +6,14 @@ const TOKEN = import.meta.env.VITE_API_TOKEN ?? ''
 
 export interface Citation {
   source: 'ticket' | 'docs'
-  // Ticket
   ticket_id?: string
   subject?: string
   resolution_type?: string
   csat_score?: number
   zendesk_url?: string
-  // Docs
   page_title?: string
   section_title?: string
   url?: string
-  // Common
   excerpt?: string
 }
 
@@ -30,6 +27,7 @@ export interface Message {
   id: string
   role: 'user' | 'assistant'
   content: string
+  reasoning?: string
   citations?: Citation[]
   confidence_score?: number
   confidence_factors?: Record<string, string | number>
@@ -39,7 +37,7 @@ export interface Message {
   loading?: boolean
 }
 
-export function useChat(sessionId: string) {
+export function useChat(sessionId: string, onFirstMessage?: (msg: string) => void) {
   const [messages, setMessages] = useState<Message[]>(() => {
     try {
       const stored = localStorage.getItem(MESSAGES_KEY(sessionId))
@@ -49,7 +47,6 @@ export function useChat(sessionId: string) {
   })
   const [isStreaming, setIsStreaming] = useState(false)
 
-  // When sessionId changes (new chat), load messages for the new session
   useEffect(() => {
     try {
       const stored = localStorage.getItem(MESSAGES_KEY(sessionId))
@@ -63,7 +60,6 @@ export function useChat(sessionId: string) {
     }
   }, [sessionId])
 
-  // Persist messages to localStorage whenever they change (skip in-progress loading bubbles)
   useEffect(() => {
     const toSave = messages.filter(m => !m.loading)
     if (toSave.length > 0) {
@@ -73,6 +69,11 @@ export function useChat(sessionId: string) {
 
   const sendMessage = useCallback(async (question: string) => {
     if (isStreaming) return
+
+    // Register session title on first message
+    if (messages.length === 0 && onFirstMessage) {
+      onFirstMessage(question)
+    }
 
     const userMsg: Message = { id: crypto.randomUUID(), role: 'user', content: question }
     const botId = crypto.randomUUID()
@@ -123,6 +124,7 @@ export function useChat(sessionId: string) {
                       ...m,
                       content,
                       loading: false,
+                      reasoning: payload.reasoning ?? '',
                       citations: payload.citations ?? [],
                       confidence_score: payload.confidence_score,
                       confidence_factors: payload.confidence_factors,
@@ -144,7 +146,7 @@ export function useChat(sessionId: string) {
           }
         }
       }
-    } catch (err) {
+    } catch {
       setMessages(prev =>
         prev.map(m =>
           m.id === botId
@@ -155,13 +157,13 @@ export function useChat(sessionId: string) {
     } finally {
       setIsStreaming(false)
     }
-  }, [isStreaming, sessionId])
+  }, [isStreaming, sessionId, messages.length, onFirstMessage])
 
-  const sendFeedback = useCallback(async (question: string, helpful: boolean, ticketIds: string[]) => {
+  const sendFeedback = useCallback(async (question: string, rating: number, ticketIds: string[], comment?: string) => {
     await fetch(`${API_URL}/feedback`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${TOKEN}` },
-      body: JSON.stringify({ session_id: sessionId, question, helpful, ticket_ids: ticketIds }),
+      body: JSON.stringify({ session_id: sessionId, question, rating, comment, ticket_ids: ticketIds }),
     })
   }, [sessionId])
 

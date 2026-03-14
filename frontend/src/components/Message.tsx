@@ -1,13 +1,106 @@
 import ReactMarkdown from 'react-markdown'
-import type { Message as MessageType } from '../hooks/useChat'
+import { useState } from 'react'
+import type { Citation, Message as MessageType } from '../hooks/useChat'
 import { CitationCard } from './CitationCard'
 import { ConfidenceBadge } from './ConfidenceBadge'
 import { SuggestedAction } from './SuggestedAction'
 import { RelatedTickets } from './RelatedTickets'
+import { ReasoningPanel } from './ReasoningPanel'
+
+const INITIAL_SHOW = 3
+
+function CitationList({ citations }: { citations: Citation[] }) {
+  const [showAll, setShowAll] = useState(false)
+  const visible = showAll ? citations : citations.slice(0, INITIAL_SHOW)
+  const hidden = citations.length - INITIAL_SHOW
+
+  return (
+    <div className="space-y-1.5">
+      <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Sources</div>
+      {visible.map((c, i) => (
+        <CitationCard key={c.ticket_id ?? `doc-${i}`} citation={c} index={i + 1} />
+      ))}
+      {!showAll && hidden > 0 && (
+        <button
+          onClick={() => setShowAll(true)}
+          className="text-xs text-indigo-600 hover:text-indigo-800 font-medium pt-0.5"
+        >
+          + {hidden} more source{hidden > 1 ? 's' : ''}
+        </button>
+      )}
+      {showAll && citations.length > INITIAL_SHOW && (
+        <button
+          onClick={() => setShowAll(false)}
+          className="text-xs text-gray-400 hover:text-gray-600 pt-0.5"
+        >
+          Show less
+        </button>
+      )}
+    </div>
+  )
+}
 
 interface Props {
   message: MessageType
-  onFeedback?: (helpful: boolean) => void
+  onFeedback?: (rating: number, comment?: string) => void
+}
+
+const FEEDBACK_KEY = (id: string) => `feedback_submitted_${id}`
+
+function FeedbackWidget({ messageId, onFeedback }: { messageId: string; onFeedback: (rating: number, comment?: string) => void }) {
+  const [selected, setSelected] = useState<number | null>(null)
+  const [comment, setComment] = useState('')
+  const [submitted, setSubmitted] = useState(() => !!localStorage.getItem(FEEDBACK_KEY(messageId)))
+
+  if (submitted) {
+    return <p className="text-xs text-gray-400 pt-1">Thanks for your feedback!</p>
+  }
+
+  const handleSubmit = () => {
+    if (selected === null) return
+    onFeedback(selected, comment.trim() || undefined)
+    localStorage.setItem(FEEDBACK_KEY(messageId), '1')
+    setSubmitted(true)
+  }
+
+  return (
+    <div className="pt-1 space-y-2">
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-xs text-gray-400 mr-1">Rate this answer:</span>
+        {Array.from({ length: 10 }, (_, i) => i + 1).map(n => (
+          <button
+            key={n}
+            onClick={() => setSelected(n)}
+            className={`w-6 h-6 text-xs rounded-md font-medium transition-colors ${
+              selected === n
+                ? 'bg-indigo-600 text-white'
+                : 'bg-gray-100 text-gray-600 hover:bg-indigo-100 hover:text-indigo-700'
+            }`}
+          >
+            {n}
+          </button>
+        ))}
+      </div>
+      {selected !== null && (
+        <div className="flex gap-2 items-start">
+          <input
+            type="text"
+            value={comment}
+            onChange={e => setComment(e.target.value)}
+            placeholder="What could be improved? (optional)"
+            className="flex-1 text-xs border border-gray-200 rounded-lg px-3 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400"
+            onKeyDown={e => e.key === 'Enter' && handleSubmit()}
+          />
+          <button
+            onClick={handleSubmit}
+            className="text-xs bg-indigo-600 text-white rounded-lg px-3 py-1.5 hover:bg-indigo-700 transition-colors shrink-0"
+          >
+            Submit
+          </button>
+        </div>
+      )}
+    </div>
+  )
 }
 
 export function Message({ message, onFeedback }: Props) {
@@ -60,14 +153,7 @@ export function Message({ message, onFeedback }: Props) {
 
         {/* Citations */}
         {message.citations && message.citations.length > 0 && (
-          <div className="space-y-1.5">
-            <div className="text-xs font-semibold text-gray-500 uppercase tracking-wide">
-              Sources
-            </div>
-            {message.citations.map((c, i) => (
-              <CitationCard key={c.ticket_id} citation={c} index={i + 1} />
-            ))}
-          </div>
+          <CitationList citations={message.citations} />
         )}
 
         {/* Related Tickets */}
@@ -75,19 +161,17 @@ export function Message({ message, onFeedback }: Props) {
           <RelatedTickets tickets={message.related_tickets} />
         )}
 
+        {/* Reasoning panel */}
+        {!message.loading && (message.reasoning || (message.citations && message.citations.length > 0)) && (
+          <ReasoningPanel
+            reasoning={message.reasoning ?? ''}
+            citations={message.citations ?? []}
+          />
+        )}
+
         {/* Feedback */}
         {!message.loading && onFeedback && (
-          <div className="flex items-center gap-2 pt-1">
-            <span className="text-xs text-gray-400">Was this helpful?</span>
-            <button
-              onClick={() => onFeedback(true)}
-              className="text-xs text-gray-400 hover:text-green-600 transition-colors"
-            >👍</button>
-            <button
-              onClick={() => onFeedback(false)}
-              className="text-xs text-gray-400 hover:text-red-500 transition-colors"
-            >👎</button>
-          </div>
+          <FeedbackWidget messageId={message.id} onFeedback={onFeedback} />
         )}
       </div>
     </div>
