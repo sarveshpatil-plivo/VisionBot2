@@ -48,7 +48,8 @@ class QueryResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     session_id: str
     question: str
-    helpful: bool                   # True = helpful, False = not helpful
+    rating: int                     # 1-10 rating
+    comment: Optional[str] = None   # Optional improvement note
     ticket_ids: list[str] = []      # Ticket IDs cited in the answer
 
 

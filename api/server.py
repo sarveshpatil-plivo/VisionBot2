@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from openai import AsyncOpenAI
 from qdrant_client import QdrantClient
 
@@ -30,8 +31,8 @@ app = FastAPI(title="SupportIQ API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_url],
-    allow_credentials=True,
+    allow_origins=["*"],  # Open for internal ngrok access; protected by API token
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -78,8 +79,10 @@ def log_query(session_id: str, question: str, final_state: dict, latency_ms: int
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+# Routes registered under both / and /api so dev proxy and prod build both work
 
 @app.get("/health", response_model=HealthResponse)
+@app.get("/api/health", response_model=HealthResponse, include_in_schema=False)
 async def health():
     try:
         _qdrant_client.get_collections()
@@ -90,6 +93,7 @@ async def health():
 
 
 @app.post("/query")
+@app.post("/api/query", include_in_schema=False)
 async def query(
     request: QueryRequest,
     _token: str = Depends(verify_token),
@@ -106,6 +110,7 @@ async def query(
         # chat_history intentionally omitted — LangGraph MemorySaver preserves it across turns
         "metadata_filters": request.metadata_filters,
         "retry_count": 0,
+        "injected_context": None,
         "is_voice_related": True,
         "is_ambiguous": False,
         "awaiting_clarification": False,
@@ -152,6 +157,7 @@ async def query(
             "confidence_factors": final_state.get("confidence_factors", {}),
             "suggested_action": final_state.get("suggested_action", ""),
             "related_tickets": final_state.get("related_tickets", []),
+            "reasoning": final_state.get("reasoning", ""),
             "intent": final_state.get("intent", ""),
             "awaiting_clarification": final_state.get("awaiting_clarification", False),
             "latency_ms": latency_ms,
@@ -164,6 +170,7 @@ async def query(
 
 
 @app.post("/feedback")
+@app.post("/api/feedback", include_in_schema=False)
 async def feedback(
     request: FeedbackRequest,
     _token: str = Depends(verify_token),
@@ -176,17 +183,19 @@ async def feedback(
         "ts": datetime.now(timezone.utc).isoformat(),
         "session_id": request.session_id,
         "question": request.question,
-        "helpful": request.helpful,
+        "rating": request.rating,
+        "comment": request.comment,
         "ticket_ids": request.ticket_ids,
     }
     with open("feedback_logs.jsonl", "a") as f:
         f.write(json.dumps(entry) + "\n")
 
-    logger.info(f"Feedback logged: helpful={request.helpful} for session {request.session_id}")
+    logger.info(f"Feedback logged: rating={request.rating} for session {request.session_id}")
     return {"status": "ok"}
 
 
 @app.get("/tickets/{ticket_id}")
+@app.get("/api/tickets/{ticket_id}", include_in_schema=False)
 async def get_ticket(
     ticket_id: str,
     _token: str = Depends(verify_token),
@@ -207,3 +216,9 @@ async def get_ticket(
         logger.error(f"Ticket fetch error: {e}")
 
     raise HTTPException(status_code=404, detail="Ticket not found")
+
+
+# ── Serve React frontend (must be last) ───────────────────────────────────────
+_frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
+if _frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="frontend")

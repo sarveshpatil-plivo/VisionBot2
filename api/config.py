@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     qdrant_problems_collection: str = "ticket_problems"
     qdrant_resolutions_collection: str = "ticket_resolutions"
 
+    # Slack
+    slack_bot_token: str = ""
+
     # Atlassian (Jira + Confluence)
     atlassian_base_url: str = ""
     atlassian_email: str = ""
@@ -32,8 +35,8 @@ class Settings(BaseSettings):
 
     # Retrieval tuning
     top_k_retrieve: int = 20
-    top_k_rerank: int = 5
-    confidence_threshold: float = 0.50
+    top_k_rerank: int = 8
+    confidence_threshold: float = 0.35
     resolution_boost: float = 1.3
     rrf_k: int = 60
 
