@@ -19,6 +19,9 @@ frontend/.env.local
 qdrant_data/
 ingestion/raw_tickets_*.jsonl
 ingestion/docs_checkpoint.jsonl
+ingestion/slack_checkpoint.jsonl
+ingestion/Confluence-export-*/
 pipeline_*.log
 watch_fetch.log
 CLAUDE.md
+.claude/
