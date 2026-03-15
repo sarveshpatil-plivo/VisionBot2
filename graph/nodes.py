@@ -107,13 +107,13 @@ Rules:
 4. Cite docs by title: "Per the Confluence doc 'Voice API Overview'..." or "Per the Plivo docs..."
 5. Do NOT reference support tickets for product explanation questions.
 6. If the docs don't cover something, say so — do not hallucinate.
-7. End with one actionable next step or relevant doc link.
+7. End with one actionable next step. If you reference a doc URL in suggested_action, use ONLY URLs from the "Available doc URLs" list supplied in the user message — never invent or guess URLs.
 
 Return ONLY a JSON object:
 {
   "reasoning": "1 sentence: which docs were relevant and why",
   "answer": "clear, structured explanation with doc citations",
-  "suggested_action": "one actionable next step or doc reference",
+  "suggested_action": "one actionable next step (if linking to docs, use only URLs from the Available doc URLs list)",
   "citations": [
     {
       "ticket_id": null,
@@ -134,7 +134,7 @@ Rules:
 5. Do NOT introduce products, features, or tools (e.g. PHLO) unless the customer mentioned them or multiple sources strongly point to them.
 6. Cite ticket sources as "Ticket #36286 showed the same pattern..." — evidence supporting your diagnosis.
 7. Cite doc sources as "Per the Confluence SOP on X..." or "Jira VT-123 confirms..."
-8. Provide one concrete suggested_action the agent can take right now.
+8. Provide one concrete suggested_action the agent can take right now. If you include a doc URL, use ONLY URLs from the "Available doc URLs" list supplied in the user message — never invent or guess URLs.
 9. If context is insufficient, state what information would help — do not hallucinate.
 10. Temporal awareness: each source shows a "Solved:" date. If an older source contradicts a newer source on the same behaviour, explicitly note that platform behaviour has likely changed and rely on the newer source.
 11. Ryuk navigation: Ryuk is Plivo's internal admin dashboard — agents look up customers by email, Auth ID, or username. When suggesting investigation steps, use exact Ryuk paths:
@@ -164,7 +164,7 @@ Return ONLY a JSON object:
 {
   "reasoning": "1-2 sentences: what are the symptoms, what is the most likely diagnosis and why",
   "answer": "expert diagnosis with root causes first, then cited evidence",
-  "suggested_action": "one concrete next step the agent can take right now",
+  "suggested_action": "one concrete next step (if linking to docs, use only URLs from the Available doc URLs list)",
   "citations": [
     {
       "ticket_id": "... or null for non-ticket sources",
@@ -584,6 +584,20 @@ async def generate_answer_node(
             )
     context = "\n\n---\n\n".join(context_parts)
 
+    # Collect real URLs from retrieved doc chunks to ground suggested_action
+    # Prevents the LLM from hallucinating Plivo docs URLs — it must use only these
+    URL_SOURCES = {"docs", "confluence"}
+    doc_urls = []
+    for c in chunks:
+        url = c.get("url", "")
+        if c.get("source") in URL_SOURCES and url and url not in doc_urls:
+            doc_urls.append(url)
+
+    doc_urls_section = ""
+    if doc_urls:
+        url_list = "\n".join(f"- {u}" for u in doc_urls)
+        doc_urls_section = f"\n\nAvailable doc URLs (use ONLY these if referencing docs in suggested_action):\n{url_list}"
+
     # Pick prompt based on query type
     prompt = DOCS_ANSWER_PROMPT if state.get("query_type") == "product_question" else ANSWER_PROMPT
 
@@ -593,7 +607,7 @@ async def generate_answer_node(
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({
         "role": "user",
-        "content": f"Question: {state['question']}\n\nContext (tickets, docs, Confluence, Jira, Slack):\n{context}",
+        "content": f"Question: {state['question']}\n\nContext (tickets, docs, Confluence, Jira, Slack):\n{context}{doc_urls_section}",
     })
 
     answer_cost_entry = None
