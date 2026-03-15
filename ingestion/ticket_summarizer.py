@@ -102,6 +102,8 @@ class TicketSummarizer:
         self.model = model
         self.cache_file = get_cache_file(year)
         self.cache = _load_cache(self.cache_file)
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     async def _summarize_one(self, ticket: dict) -> dict:
         """Summarize a single ticket using GPT-4o."""
@@ -125,6 +127,9 @@ class TicketSummarizer:
                     response_format={"type": "json_object"},
                 )
                 summary = json.loads(response.choices[0].message.content)
+                if response.usage:
+                    self.total_input_tokens += response.usage.prompt_tokens
+                    self.total_output_tokens += response.usage.completion_tokens
                 break
             except Exception as e:
                 if "rate_limit" in str(e).lower() or "429" in str(e):
