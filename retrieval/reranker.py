@@ -1,12 +1,7 @@
 """
-Cross-encoder reranker: cross-encoder/ms-marco-MiniLM-L-6-v2
+Cross-encoder reranker: ms-marco-MiniLM-L-6-v2
 Re-scores top-K retrieved chunks against the original query.
 Returns top-N after reranking.
-
-NOTE: BAAI/bge-reranker-v2-m3 was trialled but reverted — 568M params on CPU
-produced 100+ second rerank times (vs ~350ms for MiniLM). Not viable without GPU.
-MiniLM (22M params) is fast and sufficient for production on CPU.
-Scores are in roughly -10 to +10 range; confidence normalisation uses sigmoid.
 """
 
 import logging
@@ -51,7 +46,7 @@ def rerank(query: str, chunks: list[dict], top_n: int = 5) -> list[dict]:
     seen: set[str] = set()
     results = []
     for chunk, score in scored:
-        key = chunk.get("ticket_id") or chunk.get("chunk_id") or chunk.get("image_path")
+        key = chunk.get("ticket_id") or chunk.get("chunk_id")
         if key in seen:
             continue
         seen.add(key)

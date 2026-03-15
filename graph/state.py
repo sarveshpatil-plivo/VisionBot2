@@ -16,8 +16,7 @@ class AgentState(TypedDict):
     query_type: str                 # ticket_search | product_question
     is_voice_related: bool          # False = off-topic, short-circuit before retrieval
     is_ambiguous: bool
-    needs_clarification: bool       # True when query is clear but missing diagnostic details
-    clarification_question: str     # Question to ask user when ambiguous or needs_clarification
+    clarification_question: str     # Question to ask user when ambiguous
     awaiting_clarification: bool    # True when graph is paused for user input
     retry_count: int                # Prevent infinite retry loop (max 2)
 
@@ -46,4 +45,3 @@ class AgentState(TypedDict):
 
     # Observability
     timings: dict[str, int]         # Step name → elapsed ms
-    cost_entries: list[dict]        # Per-step LLM cost entries (make_entry dicts)

@@ -6,7 +6,6 @@ All nodes receive the full AgentState and return a partial state update.
 import asyncio
 import json
 import logging
-import math
 import re
 import time
 from typing import Any
@@ -14,7 +13,6 @@ from typing import Any
 from openai import AsyncOpenAI
 from qdrant_client import QdrantClient
 
-from api.cost_tracker import estimate_tokens, make_entry
 from graph.state import AgentState
 from retrieval.hyde import generate_hyde
 from retrieval.hybrid_retriever import retrieve
@@ -23,23 +21,6 @@ from retrieval.compressor import compress_chunks
 from retrieval.zendesk_fetcher import fetch_ticket_by_id
 
 _ZENDESK_URL_RE = re.compile(r'https?://[a-zA-Z0-9-]+\.zendesk\.com/agent/tickets/(\d+)')
-
-# Signals that indicate the query contains exact technical identifiers.
-# For these queries HyDE is bypassed — the raw question is embedded directly.
-# Reason: HyDE hallucinates a generic resolution for exact error strings/UUIDs,
-# pulling in wrong tickets. BM25 sparse vectors do exact string matching better.
-_TECHNICAL_SIGNAL_RE = re.compile(
-    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'  # UUID / call UUID
-    r'|\bSIP\s*[3-5]\d{2}\b'                                             # SIP response codes
-    r'|\bHTTP\s*[3-5]\d{2}\b'                                            # HTTP status codes
-    r'|Traceback \(most recent|Exception in thread|at com\.|at org\.'    # Stack traces
-    r'|EHOSTUNREACH|ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND'         # POSIX network errors
-    r'|HangupCauseCode|NORMAL_CLEARING|NO_ROUTE_DESTINATION'             # SIP/telephony hangup causes
-    r'|USER_BUSY|NO_ANSWER|CALL_REJECTED|UNALLOCATED_NUMBER'             # More SIP causes
-    r'|websocket\.send|websocket\.receive|ASGI message'                  # ASGI/WebSocket errors
-    r'|\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b',                        # IP addresses
-    re.IGNORECASE,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -53,16 +34,14 @@ Return ONLY a JSON object:
   "query_type": "ticket_search|product_question",
   "intent": "troubleshoot|explain|find-similar|summarize|other",
   "is_ambiguous": true|false,
-  "needs_clarification": true|false,
-  "clarification_question": "question to ask if is_ambiguous OR needs_clarification, else null",
+  "clarification_question": "question to ask if ambiguous, else null",
   "hyde_text": "hypothetical document text for embedding (see instructions below)"
 }
 
 STEP 1 — is_voice_related:
-- true if the query is about voice calls, SIP, WebRTC, PSTN, call quality, audio, DTMF, call routing, IVR, caller ID, call recordings, voice SDK, outbound/inbound calls, call failures, Zentrunk, CPS limits, voice capacity, or any other Plivo Voice API topic.
-- false ONLY when the query has absolutely no conceivable connection to voice: pure SMS campaigns, pure invoice/payment questions, greetings, general small talk.
-- WHEN IN DOUBT: set is_voice_related=true, needs_clarification=true, and ask a short question to understand how this relates to voice. Never reject something that might be voice-related — ask first.
-If false: set query_type="ticket_search", intent="other", is_ambiguous=false, needs_clarification=false, hyde_text=<the original question>.
+- true ONLY if the query is about: voice calls, SIP, WebRTC, PSTN, call quality, audio, DTMF, call routing, IVR, Dial XML, caller ID, call recordings, voice SDK, outbound/inbound calls, call failures, Zentrunk, or other Plivo Voice API topics.
+- false for EVERYTHING else: greetings, small talk, SMS/messaging, billing, account issues.
+If false: set query_type="ticket_search", intent="other", is_ambiguous=false, hyde_text=<the original question>.
 
 STEP 2 — query_type (if voice_related):
 - "product_question": user wants to understand a feature/concept.
@@ -74,46 +53,28 @@ If unsure, mark is_ambiguous=true and ask one clarifying question.
 STEP 3 — intent (if voice_related):
 troubleshoot | explain | find-similar | summarize
 
-STEP 4 — is_ambiguous:
-Set true ONLY if the query has two or more completely different possible interpretations.
-Example: "issue with calls" — could mean setup, quality, billing, routing.
-Ask the single most useful clarifying question.
-
-STEP 5 — needs_clarification (voice_related=true, NOT ambiguous):
-Set true ONLY when the query describes a vague symptom with ZERO diagnostic details — no error codes,
-no SDK/platform, no call direction, no reproduction pattern.
-- "my calls are dropping" → needs_clarification=true (no error code, no SDK, no pattern)
-- "audio is bad on calls" → needs_clarification=true (no platform, no direction, no codec info)
-- "SIP 403 on outbound calls" → needs_clarification=false (has error code + direction — proceed)
-- "WebRTC drops after 30s" → needs_clarification=false (has SDK + specific symptom — proceed)
-- "How does DTMF work?" → needs_clarification=false (product question — no details needed)
-If needs_clarification=true: ask for the single most valuable missing piece.
-  e.g. "What error code or behaviour are you seeing?" / "Which SDK — Browser, Android, or iOS?"
-Do NOT set needs_clarification=true if the query contains ANY specific technical signal.
-
-STEP 6 — hyde_text:
+STEP 4 — hyde_text:
 Write a short hypothetical document (2-4 sentences) that would perfectly answer this query.
 - For ticket_search: write as if you are the resolution note in a Zendesk ticket. Include likely root cause and fix.
 - For product_question: write as if you are a Plivo docs page explaining the feature.
 - Keep it dense with technical terms relevant to the query — this text will be embedded for vector search.
-If is_ambiguous=true or needs_clarification=true or is_voice_related=false, set hyde_text to the original question verbatim."""
+If is_ambiguous=true or is_voice_related=false, set hyde_text to the original question verbatim."""
 
-DOCS_ANSWER_PROMPT = """You are SupportIQ — a senior Plivo Voice API engineer. When an agent asks how something works, give a direct, complete explanation.
+DOCS_ANSWER_PROMPT = """You are SupportIQ, an expert on the Plivo Voice API.
+Answer the question using ONLY the provided documentation context (Confluence docs, Jira issues, Slack updates, Plivo developer docs).
 
 Rules:
-1. If a LIVE TICKET is present at the top of the context, treat it as the primary context for your answer.
-2. Explain directly — the agent wants to understand how something works, not a doc summary.
-3. Structure your answer: what it is → how it works → key constraints or gotchas.
-4. Cite docs by title: "Per the Confluence doc 'Voice API Overview'..." or "Per the Plivo docs..."
-5. Do NOT reference support tickets for product explanation questions.
-6. If the docs don't cover something, say so — do not hallucinate.
-7. End with one actionable next step or relevant doc link.
+1. Answer directly and clearly — the user wants to understand how a feature or concept works.
+2. Cite docs by title: "Per the Confluence doc 'Voice API Overview'..." or "Per the Plivo docs..."
+3. Do NOT pull in support tickets for product explanation questions.
+4. If the docs don't cover it, say so — do not hallucinate.
+5. Provide one actionable next step or relevant doc link.
 
 Return ONLY a JSON object:
 {
   "reasoning": "1 sentence: which docs were relevant and why",
-  "answer": "clear, structured explanation with doc citations",
-  "suggested_action": "one actionable next step or doc reference",
+  "answer": "clear explanation with doc citations",
+  "suggested_action": "one actionable next step (e.g. link to API reference or doc section)",
   "citations": [
     {
       "ticket_id": null,
@@ -124,47 +85,25 @@ Return ONLY a JSON object:
   ]
 }"""
 
-ANSWER_PROMPT = """You are SupportIQ — a senior Plivo Voice API engineer who has investigated hundreds of support cases. When an agent brings you a problem, diagnose the root cause first, then cite the evidence.
+ANSWER_PROMPT = """You are SupportIQ, an expert technical support analyst.
+Answer the question using ONLY the provided context (tickets, Confluence docs, Jira issues, Slack updates).
 
 Rules:
-1. If a LIVE TICKET is present at the top of the context, that is the primary problem — your full attention goes there.
-2. Start from symptoms: identify exactly what the customer is experiencing before naming a cause.
-3. Lead with your diagnosis — the 2-3 most likely root causes in order of probability. Bring in ticket evidence to support your diagnosis, not the other way around.
-4. Only cite a source if its root cause genuinely matches the described symptoms.
-5. Do NOT introduce products, features, or tools (e.g. PHLO) unless the customer mentioned them or multiple sources strongly point to them.
-6. Cite ticket sources as "Ticket #36286 showed the same pattern..." — evidence supporting your diagnosis.
-7. Cite doc sources as "Per the Confluence SOP on X..." or "Jira VT-123 confirms..."
+1. If a LIVE TICKET is present at the top of the context, that is the primary problem to solve — focus your answer on it.
+2. Start by identifying the customer's actual symptoms from their message. Do NOT assume a cause.
+3. Only cite a source if its root cause genuinely matches the customer's described symptoms.
+4. Do NOT introduce products, features, or tools (e.g. PHLO, specific APIs) unless the customer mentioned them or multiple sources strongly point to them.
+5. Cite ticket IDs for ticket sources: "As seen in Ticket #36286..."
+6. Cite doc titles for Confluence/Jira/Slack sources: "Per the Confluence SOP on X..." or "Jira issue VT-123 shows..."
+7. If multiple sources show the same root cause, note the pattern.
 8. Provide one concrete suggested_action the agent can take right now.
-9. If context is insufficient, state what information would help — do not hallucinate.
-10. Temporal awareness: each source shows a "Solved:" date. If an older source contradicts a newer source on the same behaviour, explicitly note that platform behaviour has likely changed and rely on the newer source.
-11. Ryuk navigation: Ryuk is Plivo's internal admin dashboard — agents look up customers by email, Auth ID, or username. When suggesting investigation steps, use exact Ryuk paths:
-    - Account state: Account Management → Accounts → [search email] → Account Settings tab.
-      Key fields: Enabled (Yes/No), Voice Enabled, Zentrunk Enabled, CPS Allowed, Zentrunk CPS Allowed, Voice Carrier Type, Plivo Carrier Fallback, Risk Status, Account Notes.
-    - Call records (Voice API): Voice → Fetch CDRs (search by call UUID or date range)
-    - Call visual trace: Voice → Call Timeline (search by call UUID — shows full SIP/media event sequence)
-    - PCAP analysis: Voice → PCAP Analyser v2 (load PCAP for a call UUID — check SIP responses, RTP, carrier leg failures)
-    - CPS limits: Voice → Voice CPS utilisation (check if customer is hitting their CPS ceiling)
-    - Zentrunk trunks: Zentrunk → Trunks (credentials, IP whitelist, registration status)
-    - Zentrunk call records: Zentrunk → Fetch CDRs
-    - Zentrunk routing: Zentrunk → Routing (check routing profile assigned to account)
-    - Number issues: Numbers → Number Management or Number History
-    - Finance / limit charges: Finance → Recurring Charge (add charges for CPS/limit increases)
-    Always prefer "In Ryuk → [section] → [subsection], look up [customer email], check [specific field]" over vague "check the console" instructions.
-
-EXAMPLE — what good looks like:
----
-Q: "Customer getting SIP 403 Forbidden on outbound calls. Started yesterday."
-
-BAD answer: "Based on Ticket #36286, this may be a SIP authentication issue. See also Ticket #44123."
-
-GOOD answer: "SIP 403 on outbound calls means the carrier rejected the auth request — this is a carrier-side failure, not Plivo. Root causes in order of likelihood: (1) Plivo media server IP not whitelisted on the carrier portal — most common trigger for failures that 'just started' since IPs can rotate; (2) SIP trunk credentials changed on the carrier side but not updated in Plivo config; (3) From header format mismatch. Tickets #36286 and #44123 both matched this exact pattern and were resolved by re-adding Plivo's current media server IPs to the carrier whitelist. Start there: pull the current Plivo media IPs from the console and verify they're listed on the carrier portal."
----
+9. If context is insufficient, say so clearly — do not hallucinate.
 
 Return ONLY a JSON object:
 {
-  "reasoning": "1-2 sentences: what are the symptoms, what is the most likely diagnosis and why",
-  "answer": "expert diagnosis with root causes first, then cited evidence",
-  "suggested_action": "one concrete next step the agent can take right now",
+  "reasoning": "1-2 sentences: what are the customer's symptoms, which sources match and why",
+  "answer": "your answer with citations",
+  "suggested_action": "one concrete actionable next step",
   "citations": [
     {
       "ticket_id": "... or null for non-ticket sources",
@@ -232,7 +171,6 @@ async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) ->
         snippet = injected[:800]
         user_msg = f"[Live ticket submitted for analysis]\n{snippet}\n\n---\nAgent's question: {user_msg}"
 
-    classify_cost_entry = None
     try:
         response = await client.chat.completions.create(
             model=model,
@@ -244,11 +182,6 @@ async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) ->
             response_format={"type": "json_object"},
         )
         result = json.loads(response.choices[0].message.content)
-        if response.usage:
-            classify_cost_entry = make_entry(
-                "classify+hyde", model,
-                response.usage.prompt_tokens, response.usage.completion_tokens,
-            )
     except Exception as e:
         logger.error(f"Classify+HyDE failed: {e}")
         result = {
@@ -263,39 +196,19 @@ async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) ->
     is_voice = result.get("is_voice_related", True)
     query_type = result.get("query_type", "ticket_search")
     hyde_text = result.get("hyde_text") or state["question"]
-
-    # HyDE bypass: if query contains exact technical signals (UUIDs, SIP/HTTP error codes,
-    # stack traces, IP addresses), embed the raw question instead of the hallucinated
-    # hypothetical. BM25 sparse vectors handle exact string matching better than a
-    # generic LLM-generated resolution document.
-    hyde_bypassed = False
-    if _TECHNICAL_SIGNAL_RE.search(state["question"]):
-        hyde_text = state["question"]
-        hyde_bypassed = True
-
-    costs = list(state.get("cost_entries") or [])
-    if classify_cost_entry:
-        costs.append(classify_cost_entry)
-
-    is_ambiguous = result.get("is_ambiguous", False)
-    needs_clarification = result.get("needs_clarification", False)
-
     elapsed = int((time.monotonic() - t0) * 1000)
     logger.info(
         f"Classify+HyDE: voice={is_voice} | type={query_type} | intent={result.get('intent')} "
-        f"| ambiguous={is_ambiguous} | needs_clarification={needs_clarification} "
-        f"| hyde_bypass={hyde_bypassed} | {elapsed}ms"
+        f"| ambiguous={result.get('is_ambiguous')} | {elapsed}ms"
     )
     return {
         "is_voice_related": is_voice,
         "query_type": query_type,
         "intent": result.get("intent", "troubleshoot"),
-        "is_ambiguous": is_ambiguous,
-        "needs_clarification": needs_clarification,
+        "is_ambiguous": result.get("is_ambiguous", False),
         "clarification_question": result.get("clarification_question"),
-        "awaiting_clarification": is_ambiguous or needs_clarification,
+        "awaiting_clarification": result.get("is_ambiguous", False),
         "hyde_text": hyde_text,
-        "cost_entries": costs,
         "timings": {**(state.get("timings") or {}), "classify_ms": elapsed},
     }
 
@@ -313,17 +226,11 @@ async def generate_hyde_node(
     # hyde_text already set by classify_intent (merged call)
     hyde_text = state.get("hyde_text") or state["question"]
     dense, sparse = await embedder.embed_query_async(hyde_text)
-
-    embed_entry = make_entry("embed_hyde", embedder.dense_model, estimate_tokens(hyde_text))
-    costs = list(state.get("cost_entries") or [])
-    costs.append(embed_entry)
-
     elapsed = int((time.monotonic() - t0) * 1000)
     logger.info(f"Embed: {elapsed}ms")
     return {
         "hyde_dense": dense,
         "hyde_sparse": sparse,
-        "cost_entries": costs,
         "timings": {**(state.get("timings") or {}), "hyde_ms": elapsed},
     }
 
@@ -373,78 +280,19 @@ async def compress_node(
     state: AgentState,
     client: AsyncOpenAI,
     model: str,
-    qdrant: QdrantClient = None,
 ) -> dict:
-    """
-    Contextual compression — only for product_question queries (verbose Confluence/Slack docs).
-
-    For ticket_search: compression is SKIPPED. Raw chunks go directly to GPT-4o.
-    Reason: GPT-4o-mini compression strips technical "noise" — stack traces, SIP headers,
-    call UUIDs, log timestamps — that GPT-4o needs for accurate diagnosis. GPT-4o has a
-    128k context window; 4 raw ticket chunks (~3k tokens) is trivial. Removing compression
-    saves ~2.2s and preserves the exact technical signals the model needs.
-
-    For product_question: compression is kept. Confluence/Slack/Jira docs can be verbose
-    and repetitive; trimming to relevant sentences genuinely helps here.
-    """
+    """Contextual compression — top 4 reranked chunks only (bottom half low-signal after reranking)."""
     t0 = time.monotonic()
-
-    if state.get("query_type") == "ticket_search":
-        # Parent-child expansion: for each winning ticket, fetch ALL its sibling chunks
-        # (problem + investigation + resolution) and combine into one context block.
-        # This ensures GPT-4o sees the full diagnostic thread, not just the one chunk
-        # that won the reranker lottery.
-        _CHUNK_ORDER = {"problem": 0, "investigation": 1, "resolution": 2}
-        winning_chunks = state.get("reranked_chunks", [])[:4]
-        expanded = []
-        for c in winning_chunks:
-            tid = c.get("ticket_id")
-            if not tid or not qdrant:
-                c = dict(c)
-                c["compressed_text"] = c.get("text", "")
-                expanded.append(c)
-                continue
-
-            siblings = _fetch_all_ticket_chunks(qdrant, str(tid))
-            siblings.sort(key=lambda x: _CHUNK_ORDER.get(x.get("chunk_type", ""), 99))
-
-            parts = []
-            for s in siblings:
-                label = s.get("chunk_type", "context").upper()
-                parts.append(f"[{label}]\n{s.get('text', '')}")
-
-            c = dict(c)
-            c["compressed_text"] = "\n\n".join(parts) if parts else c.get("text", "")
-            expanded.append(c)
-
-        elapsed = int((time.monotonic() - t0) * 1000)
-        logger.info(f"Compress: parent-child expansion {len(winning_chunks)} tickets → {len(expanded)} expanded in {elapsed}ms")
-        return {
-            "compressed_chunks": expanded,
-            "timings": {**(state.get("timings") or {}), "compress_ms": elapsed},
-        }
-
-    # product_question: compress Confluence/Slack/Jira docs
-    input_chunks = state["reranked_chunks"][:4]
     compressed = await compress_chunks(
         client=client,
         query=state["question"],
-        chunks=input_chunks,
+        chunks=state["reranked_chunks"][:4],
         model=model,
     )
-
-    # Estimate cost: no response.usage exposed by compress_chunks, so use text length heuristic
-    compress_input = sum(estimate_tokens(c.get("text", "")) for c in input_chunks)
-    compress_output = min(200 * len(input_chunks), 800)  # max_tokens=200 per chunk
-    compress_entry = make_entry("compress", model, compress_input, compress_output)
-    costs = list(state.get("cost_entries") or [])
-    costs.append(compress_entry)
-
     elapsed = int((time.monotonic() - t0) * 1000)
     logger.info(f"Compress: {elapsed}ms")
     return {
         "compressed_chunks": compressed,
-        "cost_entries": costs,
         "timings": {**(state.get("timings") or {}), "compress_ms": elapsed},
     }
 
@@ -467,10 +315,9 @@ def check_confidence_node(state: AgentState, threshold: float) -> dict:
             "confidence_factors": {"error": "No chunks retrieved"},
         }
 
-    # Factor 1: Top reranker score normalised 0-1 via sigmoid.
-    # bge-reranker-v2-m3 returns raw logits (any range); sigmoid maps them cleanly to 0-1.
+    # Factor 1: Top reranker score (normalised 0-1) — used by both paths
     top_score = chunks[0].get("rerank_score", 0)
-    retrieval_sim = 1 / (1 + math.exp(-top_score))
+    retrieval_sim = min(max((top_score + 10) / 20, 0), 1)
 
     if state.get("query_type") == "product_question":
         # ── Docs path ──────────────────────────────────────────────────────────
@@ -549,7 +396,7 @@ async def generate_answer_node(
     t0 = time.monotonic()
     chunks = state.get("compressed_chunks") or state.get("reranked_chunks", [])
 
-    DOC_SOURCES = {"docs", "confluence", "jira", "slack", "ryuk"}
+    DOC_SOURCES = {"docs", "confluence", "jira", "slack"}
 
     # Build context — live ticket first (if present), then RAG chunks
     context_parts = []
@@ -569,8 +416,6 @@ async def generate_answer_node(
                 label = f"Jira {c.get('project', '')} — {c.get('summary', c.get('title', 'N/A'))}"
             elif source == "slack":
                 label = f"Slack #{c.get('channel', 'N/A')}"
-            elif source == "ryuk":
-                label = f"Ryuk — {c.get('nav_path', c.get('section', 'N/A'))}"
             else:
                 label = f"Plivo Docs — {c.get('page_title', 'N/A')} > {c.get('section_title', '')}"
             context_parts.append(f"[{label}]\n{text}")
@@ -578,8 +423,7 @@ async def generate_answer_node(
             context_parts.append(
                 f"[Ticket #{c.get('ticket_id', 'N/A')} — {c.get('subject', 'N/A')}]\n"
                 f"Type: {c.get('chunk_type')} | Product: {c.get('product')} | "
-                f"Region: {c.get('region')} | CSAT: {c.get('csat_score', 'N/A')} | "
-                f"Solved: {c.get('solved_at') or c.get('created_at', 'N/A')}\n"
+                f"Region: {c.get('region')} | CSAT: {c.get('csat_score', 'N/A')}\n"
                 f"{text}"
             )
     context = "\n\n---\n\n".join(context_parts)
@@ -596,7 +440,6 @@ async def generate_answer_node(
         "content": f"Question: {state['question']}\n\nContext (tickets, docs, Confluence, Jira, Slack):\n{context}",
     })
 
-    answer_cost_entry = None
     try:
         response = await client.chat.completions.create(
             model=model,
@@ -605,11 +448,6 @@ async def generate_answer_node(
             response_format={"type": "json_object"},
         )
         result = json.loads(response.choices[0].message.content)
-        if response.usage:
-            answer_cost_entry = make_entry(
-                "answer", model,
-                response.usage.prompt_tokens, response.usage.completion_tokens,
-            )
     except Exception as e:
         logger.error(f"Answer generation failed: {e}")
         result = {
@@ -649,20 +487,16 @@ async def generate_answer_node(
         })
 
     # Append non-ticket chunks that appeared in context as supplementary citations
-    DOC_SOURCES = {"docs", "confluence", "jira", "slack", "ryuk"}
+    DOC_SOURCES = {"docs", "confluence", "jira", "slack"}
     for c in chunks:
         if c.get("source") in DOC_SOURCES:
             enriched_citations.append({
                 "source": c.get("source"),
-                "page_title": c.get("title") or c.get("page_title") or c.get("nav_path") or c.get("summary", ""),
+                "page_title": c.get("title") or c.get("page_title") or c.get("summary", ""),
                 "section_title": c.get("section_title") or c.get("channel") or c.get("project", ""),
                 "url": c.get("url", ""),
                 "excerpt": (c.get("compressed_text") or c.get("text", ""))[:200],
             })
-
-    costs = list(state.get("cost_entries") or [])
-    if answer_cost_entry:
-        costs.append(answer_cost_entry)
 
     elapsed = int((time.monotonic() - t0) * 1000)
     logger.info(f"Answer generation: {elapsed}ms")
@@ -673,34 +507,8 @@ async def generate_answer_node(
         "suggested_action": result.get("suggested_action", ""),
         "related_tickets": related,
         "chat_history": history,
-        "cost_entries": costs,
         "timings": {**(state.get("timings") or {}), "answer_ms": elapsed},
     }
-
-
-def _fetch_all_ticket_chunks(qdrant: QdrantClient, ticket_id: str) -> list[dict]:
-    """
-    Fetch all sibling chunks (problem + investigation + resolution) for a ticket.
-    Searches both Qdrant collections so parent-child context is always complete.
-    """
-    from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-    all_chunks = []
-    for collection in ("ticket_problems", "ticket_resolutions"):
-        try:
-            results = qdrant.scroll(
-                collection_name=collection,
-                scroll_filter=Filter(
-                    must=[FieldCondition(key="ticket_id", match=MatchValue(value=ticket_id))]
-                ),
-                limit=5,
-                with_vectors=False,
-            )
-            for point in results[0]:
-                all_chunks.append(point.payload)
-        except Exception as e:
-            logger.warning(f"Failed to fetch {collection} chunks for ticket {ticket_id}: {e}")
-    return all_chunks
 
 
 def _fetch_related(qdrant: QdrantClient, chunks: list[dict]) -> list[dict]:

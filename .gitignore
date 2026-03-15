@@ -11,9 +11,6 @@ summaries_cache.jsonl
 summaries_cache_voice.jsonl
 query_logs.jsonl
 feedback_logs.jsonl
-cost_logs.jsonl
-pipeline_cost_logs.jsonl
-monthly_cost_summary.json
 ingestion/voice_api_tickets.json
 ingestion/jira_checkpoint.jsonl
 frontend/.env.local

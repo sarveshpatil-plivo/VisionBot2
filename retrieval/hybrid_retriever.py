@@ -2,9 +2,7 @@
 Hybrid retrieval: dense + BM25 sparse vectors, guaranteed lanes.
 Lane A (tickets): ticket_resolutions + ticket_problems → RRF → top N
 Lane B (docs):    support_docs → score × source_multiplier → top N
-Lane C (ryuk):    ryuk_docs → always top-1 (reranker decides final relevance)
-All lanes always searched. query_type shifts A/B slot allocation, not source exclusion.
-Lane C is a fixed +1 slot that cannot be competed away by tickets or docs.
+Both lanes always searched. query_type shifts slot allocation, not source exclusion.
 """
 
 import logging
@@ -111,18 +109,6 @@ def _rank_docs_lane(docs_results: list[dict], top_k: int) -> list[dict]:
     return docs_results[:top_k]
 
 
-def _ryuk_lane(ryuk_results: list[dict], top_k: int = 1) -> list[dict]:
-    """
-    Lane C: always include the top Ryuk navigation result.
-    The cross-encoder reranker decides final relevance — no score threshold here.
-    Returns empty list if ryuk_docs collection is absent or empty (safe before indexing).
-    """
-    for hit in ryuk_results:
-        hit["lane"] = "ryuk"
-    ryuk_results.sort(key=lambda h: h.get("similarity", 0), reverse=True)
-    return ryuk_results[:top_k]
-
-
 def _qdrant_hits_to_dicts(hits) -> list[dict]:
     return [
         {**point.payload, "similarity": point.score}
@@ -188,13 +174,12 @@ def retrieve(
             logger.error(f"Search failed on '{collection}': {e}")
             return []
 
-    # All 4 searches in parallel (ticket_resolutions, ticket_problems, support_docs, ryuk_docs)
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    # All 3 searches in parallel
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
             executor.submit(_search, "ticket_resolutions"): "resolutions",
             executor.submit(_search, "ticket_problems"): "problems",
             executor.submit(_search, "support_docs"): "docs",
-            executor.submit(_search, "ryuk_docs"): "ryuk",
         }
         raw = {}
         for future in as_completed(futures):
@@ -202,11 +187,10 @@ def retrieve(
 
     ticket_candidates = _merge_ticket_lane(raw["resolutions"], raw["problems"], top_k=ticket_slots)
     docs_candidates = _rank_docs_lane(raw["docs"], top_k=docs_slots)
-    ryuk_candidates = _ryuk_lane(raw.get("ryuk", []), top_k=1)
 
-    merged = ticket_candidates + docs_candidates + ryuk_candidates
+    merged = ticket_candidates + docs_candidates
     logger.info(
         f"Lanes [{query_type}]: {len(ticket_candidates)} tickets + {len(docs_candidates)} docs "
-        f"+ {len(ryuk_candidates)} ryuk = {len(merged)} candidates → reranker"
+        f"= {len(merged)} candidates → reranker"
     )
     return merged

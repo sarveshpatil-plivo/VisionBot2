@@ -16,7 +16,6 @@ from openai import AsyncOpenAI
 from qdrant_client import QdrantClient
 
 from api.config import settings
-from api.cost_tracker import log_query_cost
 from api.models import FeedbackRequest, HealthResponse, QueryRequest, QueryResponse
 from graph.graph import build_graph
 from ingestion.embedder import Embedder
@@ -166,12 +165,6 @@ async def query(
         yield f"data: {json.dumps(metadata)}\n\n"
 
         log_query(request.session_id, request.question, final_state, latency_ms)
-        log_query_cost(
-            session_id=request.session_id,
-            question=request.question,
-            query_type=final_state.get("query_type", ""),
-            cost_entries=final_state.get("cost_entries") or [],
-        )
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

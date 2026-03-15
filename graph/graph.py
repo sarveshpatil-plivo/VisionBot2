@@ -65,7 +65,6 @@ def build_graph(
             state,
             client=openai_client,
             model=settings.llm_mini_model,
-            qdrant=qdrant_client,
         )
 
     def node_confidence(state):
@@ -105,10 +104,7 @@ def build_graph(
     def route_after_classify(state) -> str:
         if not state.get("is_voice_related", True):
             return "reject_off_topic"
-        # Ask for clarification on first turn only — if chat_history exists the agent
-        # has already responded to a clarification request, so proceed with retrieval
-        no_history = not state.get("chat_history")
-        if (state.get("is_ambiguous") or state.get("needs_clarification")) and no_history:
+        if state.get("is_ambiguous") and not state.get("chat_history"):
             return "ask_clarification"
         return "generate_hyde"
 

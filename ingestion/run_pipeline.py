@@ -27,7 +27,6 @@ from qdrant_client import QdrantClient
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.config import settings
-from api.cost_tracker import estimate_tokens, log_pipeline_cost, make_entry
 from ingestion.zendesk_extractor import ZendeskExtractor
 from ingestion.ticket_summarizer import TicketSummarizer, load_all_caches
 from ingestion.chunker import chunk_tickets
@@ -89,7 +88,6 @@ def _parse_since(since_str: str) -> str:
 
 async def run(incremental: bool = False, since_date: str = None, fetch_only: bool = False, stop_after_summarize: bool = False, summarize_year: int = None):
     mode = "incremental" if incremental else (f"since {since_date}" if since_date else "full")
-    pipeline_cost_entries: list[dict] = []
     logger.info(f"Starting ingestion pipeline — mode: {mode}")
 
     extractor = ZendeskExtractor(
@@ -164,19 +162,7 @@ async def run(incremental: bool = False, since_date: str = None, fetch_only: boo
     summaries = {str(s["ticket_id"]): s for s in summaries_list}
     logger.info(f"Summarized {len(summaries)} tickets")
 
-    if summarizer.total_input_tokens > 0:
-        pipeline_cost_entries.append(make_entry(
-            "summarize", settings.llm_mini_model,
-            summarizer.total_input_tokens, summarizer.total_output_tokens,
-        ))
-
     if stop_after_summarize or summarize_year:
-        if pipeline_cost_entries:
-            log_pipeline_cost(
-                script="run_pipeline.py",
-                reason=f"Summarization only — {mode} ({len(tickets_to_summarize)} tickets)",
-                cost_entries=pipeline_cost_entries,
-            )
         logger.info("Stopping after summarization. Run without --summarize-year / --stop-after-summarize to continue.")
         return
 
@@ -190,8 +176,6 @@ async def run(incremental: bool = False, since_date: str = None, fetch_only: boo
 
     # ── Step 4: Embed ────────────────────────────────────────────────────────
     logger.info("Step 4: Generating embeddings...")
-    embed_token_estimate = sum(estimate_tokens(c.get("text", "")) for c in chunks)
-    pipeline_cost_entries.append(make_entry("embed_chunks", settings.embedding_model, embed_token_estimate))
     embedded_chunks = await embedder.embed_chunks(chunks)
 
     # ── Step 5: Upsert to Qdrant ─────────────────────────────────────────────
@@ -201,13 +185,6 @@ async def run(incremental: bool = False, since_date: str = None, fetch_only: boo
     # ── Step 6: Cluster ──────────────────────────────────────────────────────
     logger.info("Step 6: Assigning clusters...")
     assign_clusters(qdrant, embedded_chunks)
-
-    if pipeline_cost_entries:
-        log_pipeline_cost(
-            script="run_pipeline.py",
-            reason=f"Full ingestion — {mode} ({len(raw_tickets)} tickets, {len(chunks)} chunks)",
-            cost_entries=pipeline_cost_entries,
-        )
 
     extractor.close()
     logger.info("Pipeline complete!")
