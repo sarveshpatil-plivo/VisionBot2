@@ -83,13 +83,19 @@ export function useChat(sessionId: string, onFirstMessage?: (msg: string) => voi
     setIsStreaming(true)
 
     try {
+      // Send the full conversation history so the backend always has complete context.
+      // Filter out loading placeholders; only include role + content for the backend.
+      const priorContext = messages
+        .filter(m => !m.loading)
+        .map(m => ({ role: m.role, content: m.content }))
+
       const resp = await fetch(`${API_URL}/query`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${TOKEN}`,
         },
-        body: JSON.stringify({ question, session_id: sessionId, metadata_filters: {} }),
+        body: JSON.stringify({ question, session_id: sessionId, metadata_filters: {}, prior_context: priorContext }),
       })
 
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`)

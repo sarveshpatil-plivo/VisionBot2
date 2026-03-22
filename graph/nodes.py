@@ -9,6 +9,8 @@ import logging
 import math
 import re
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -19,7 +21,6 @@ from graph.state import AgentState
 from retrieval.hyde import generate_hyde
 from retrieval.hybrid_retriever import retrieve
 from retrieval.reranker import rerank
-from retrieval.compressor import compress_chunks
 from retrieval.zendesk_fetcher import fetch_ticket_by_id
 
 _ZENDESK_URL_RE = re.compile(r'https?://[a-zA-Z0-9-]+\.zendesk\.com/agent/tickets/(\d+)')
@@ -42,6 +43,45 @@ _TECHNICAL_SIGNAL_RE = re.compile(
 )
 
 logger = logging.getLogger(__name__)
+
+_RETRIEVAL_DEBUG_FILE = Path("retrieval_debug.jsonl")
+
+
+def _log_retrieval_debug(state: AgentState) -> None:
+    """
+    Write a per-query retrieval debug record so we can inspect exactly what
+    GPT-4o worked with: HyDE text, top-20 retrieved chunks, top-5/8 reranked,
+    confidence score, and which chunks made it to the answer.
+    """
+    def _slim(chunks: list[dict], score_key: str = "rrf_score") -> list[dict]:
+        return [
+            {
+                "ticket_id": c.get("ticket_id"),
+                "subject": c.get("subject") or c.get("title") or c.get("summary") or c.get("nav_path", ""),
+                "source": c.get("source", "ticket"),
+                "chunk_type": c.get("chunk_type", ""),
+                score_key: round(float(c.get(score_key, 0) or 0), 4),
+            }
+            for c in (chunks or [])
+        ]
+
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "session_id": state.get("session_id", ""),
+        "question": state.get("question", ""),
+        "query_type": state.get("query_type", ""),
+        "hyde_text": state.get("hyde_text", ""),
+        "retrieved_top20": _slim(state.get("retrieved_chunks", []), "rrf_score"),
+        "reranked_top_n": _slim(state.get("reranked_chunks", []), "rerank_score"),
+        "confidence_score": round(float(state.get("confidence_score", 0) or 0), 3),
+        "confidence_factors": state.get("confidence_factors", {}),
+    }
+    try:
+        with open(_RETRIEVAL_DEBUG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to write retrieval debug log: {e}")
+
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
@@ -80,13 +120,27 @@ Example: "issue with calls" — could mean setup, quality, billing, routing.
 Ask the single most useful clarifying question.
 
 STEP 5 — needs_clarification (voice_related=true, NOT ambiguous):
-Set true ONLY when the query describes a vague symptom with ZERO diagnostic details — no error codes,
-no SDK/platform, no call direction, no reproduction pattern.
-- "my calls are dropping" → needs_clarification=true (no error code, no SDK, no pattern)
-- "audio is bad on calls" → needs_clarification=true (no platform, no direction, no codec info)
-- "SIP 403 on outbound calls" → needs_clarification=false (has error code + direction — proceed)
-- "WebRTC drops after 30s" → needs_clarification=false (has SDK + specific symptom — proceed)
-- "How does DTMF work?" → needs_clarification=false (product question — no details needed)
+IMPORTANT: Default is needs_clarification=false. Only set true as a last resort.
+
+Set true ONLY when ALL of these are true simultaneously:
+  (a) the query is ticket_search (NOT product_question — product questions never need clarification)
+  (b) the symptom is so vague that retrieval would return random results
+  (c) there is literally no specific signal — no feature name, no direction, no behaviour description
+
+GOOD examples of when to clarify:
+- "my calls don't work" → needs_clarification=true (zero signal)
+- "I have an issue" → needs_clarification=true (no feature, no symptom)
+
+BAD examples (DO NOT clarify — retrieve and answer):
+- "audio is bad on calls" → needs_clarification=false (symptom is clear, retrieve on it)
+- "recording has voice overlap in part of the call but not the full recording" → needs_clarification=false (specific symptom, retrieve)
+- "audio one-way on WebRTC" → needs_clarification=false (has SDK + direction)
+- "SIP 403 on outbound calls" → needs_clarification=false (has error + direction)
+- "WebRTC drops after 30s" → needs_clarification=false (has SDK + timing)
+- "How does DTMF work?" → needs_clarification=false (product question)
+- "tell me about call recordings" → needs_clarification=false (feature name is enough to retrieve)
+- "help me with this ticket" (with ticket context above) → needs_clarification=false (ticket IS the context)
+
 If needs_clarification=true: ask for the single most valuable missing piece.
   e.g. "What error code or behaviour are you seeing?" / "Which SDK — Browser, Android, or iOS?"
 Do NOT set needs_clarification=true if the query contains ANY specific technical signal.
@@ -218,7 +272,7 @@ async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) ->
     t0 = time.monotonic()
     history_text = ""
     if state.get("chat_history"):
-        last = state["chat_history"][-3:]
+        last = state["chat_history"][-6:]
         history_text = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in last)
 
     user_msg = state["question"]
@@ -279,6 +333,12 @@ async def classify_intent(state: AgentState, client: AsyncOpenAI, model: str) ->
 
     is_ambiguous = result.get("is_ambiguous", False)
     needs_clarification = result.get("needs_clarification", False)
+
+    # If a live ticket was injected, the ticket IS the context — never ask for clarification.
+    # The agent pasted a URL specifically to get an answer; asking follow-up questions is wrong.
+    if state.get("injected_context"):
+        is_ambiguous = False
+        needs_clarification = False
 
     elapsed = int((time.monotonic() - t0) * 1000)
     logger.info(
@@ -376,16 +436,12 @@ async def compress_node(
     qdrant: QdrantClient = None,
 ) -> dict:
     """
-    Contextual compression — only for product_question queries (verbose Confluence/Slack docs).
+    For ticket_search: parent-child expansion — fetches all sibling chunks (problem +
+    investigation + resolution) for each winning ticket and combines into one block.
+    GPT-4o sees the full diagnostic thread, not just the chunk that won the reranker.
 
-    For ticket_search: compression is SKIPPED. Raw chunks go directly to GPT-4o.
-    Reason: GPT-4o-mini compression strips technical "noise" — stack traces, SIP headers,
-    call UUIDs, log timestamps — that GPT-4o needs for accurate diagnosis. GPT-4o has a
-    128k context window; 4 raw ticket chunks (~3k tokens) is trivial. Removing compression
-    saves ~2.2s and preserves the exact technical signals the model needs.
-
-    For product_question: compression is kept. Confluence/Slack/Jira docs can be verbose
-    and repetitive; trimming to relevant sentences genuinely helps here.
+    For product_question: pass-through — LLM compression removed. GPT-4o-mini was
+    stripping relevant doc context; GPT-4o has 128k context and doesn't need it.
     """
     t0 = time.monotonic()
 
@@ -424,27 +480,20 @@ async def compress_node(
             "timings": {**(state.get("timings") or {}), "compress_ms": elapsed},
         }
 
-    # product_question: compress Confluence/Slack/Jira docs
+    # product_question: pass through reranked chunks without LLM compression.
+    # GPT-4o-mini compression was stripping relevant doc context; GPT-4o has 128k
+    # context and doesn't need it. Raw chunks give the model the full picture.
     input_chunks = state["reranked_chunks"][:4]
-    compressed = await compress_chunks(
-        client=client,
-        query=state["question"],
-        chunks=input_chunks,
-        model=model,
-    )
-
-    # Estimate cost: no response.usage exposed by compress_chunks, so use text length heuristic
-    compress_input = sum(estimate_tokens(c.get("text", "")) for c in input_chunks)
-    compress_output = min(200 * len(input_chunks), 800)  # max_tokens=200 per chunk
-    compress_entry = make_entry("compress", model, compress_input, compress_output)
-    costs = list(state.get("cost_entries") or [])
-    costs.append(compress_entry)
+    passed_through = []
+    for c in input_chunks:
+        c = dict(c)
+        c["compressed_text"] = c.get("text", "")
+        passed_through.append(c)
 
     elapsed = int((time.monotonic() - t0) * 1000)
-    logger.info(f"Compress: {elapsed}ms")
+    logger.info(f"Compress: pass-through (no LLM) {len(passed_through)} doc chunks in {elapsed}ms")
     return {
-        "compressed_chunks": compressed,
-        "cost_entries": costs,
+        "compressed_chunks": passed_through,
         "timings": {**(state.get("timings") or {}), "compress_ms": elapsed},
     }
 
@@ -547,6 +596,10 @@ async def generate_answer_node(
 ) -> dict:
     """CoT answer generation using compressed chunks as context."""
     t0 = time.monotonic()
+
+    # Log full retrieval pipeline state for debugging answer quality
+    _log_retrieval_debug(state)
+
     chunks = state.get("compressed_chunks") or state.get("reranked_chunks", [])
 
     DOC_SOURCES = {"docs", "confluence", "jira", "slack", "ryuk"}
@@ -603,7 +656,7 @@ async def generate_answer_node(
 
     # Include recent chat history for multi-turn awareness
     messages = [{"role": "system", "content": prompt}]
-    for turn in (state.get("chat_history") or [])[-4:]:
+    for turn in (state.get("chat_history") or [])[-8:]:
         messages.append({"role": turn["role"], "content": turn["content"]})
     messages.append({
         "role": "user",

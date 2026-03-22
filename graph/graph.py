@@ -43,7 +43,7 @@ def build_graph(
         return await classify_intent(
             state,
             client=openai_client,
-            model=settings.llm_mini_model,
+            model=settings.llm_model,  # GPT-4o: better HyDE = better retrieval
         )
 
     async def node_hyde(state):
@@ -92,9 +92,17 @@ def build_graph(
 
     def node_ask_clarification(state):
         """Return the clarification question — graph pauses here for user input."""
+        question = state.get("clarification_question", "Could you provide more details?")
+        # Append to chat_history so the next turn sees non-empty history.
+        # Without this, route_after_classify sees no_history=True every turn and
+        # keeps asking clarification forever even after the user answers.
+        history = list(state.get("chat_history") or [])
+        history.append({"role": "user", "content": state.get("question", "")})
+        history.append({"role": "assistant", "content": question})
         return {
-            "answer": state.get("clarification_question", "Could you provide more details?"),
+            "answer": question,
             "awaiting_clarification": True,
+            "chat_history": history,
             "citations": [],
             "suggested_action": "",
             "related_tickets": [],

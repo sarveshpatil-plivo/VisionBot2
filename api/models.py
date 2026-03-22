@@ -8,6 +8,8 @@ class QueryRequest(BaseModel):
     question: str
     session_id: str                          # For multi-turn routing
     metadata_filters: dict[str, str] = {}   # Optional: {"product": "voice_api"}
+    prior_context: list[dict] = []          # Last N {role, content} turns sent by frontend
+                                             # Makes multi-turn resilient to server restarts
 
 
 class Citation(BaseModel):

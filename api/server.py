@@ -25,6 +25,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s — %(
 logger = logging.getLogger(__name__)
 
 LOG_FILE = Path("query_logs.jsonl")
+ANSWER_LOG_FILE = Path("answer_log.jsonl")
+
+# Version tag — bump this when the pipeline changes so answer_log.jsonl
+# entries from different configurations can be compared side by side.
+# v1 = gpt-4o-mini HyDE + LLM compression
+# v2 = gpt-4o-mini HyDE + parent-child expansion (no LLM compress for ticket_search)
+# v3 = gpt-4o HyDE + no LLM compression at all
+PIPELINE_VERSION = "v3-gpt4o-hyde-no-compress"
 
 # ── App init ──────────────────────────────────────────────────────────────────
 
@@ -79,6 +87,33 @@ def log_query(session_id: str, question: str, final_state: dict, latency_ms: int
     logger.info(f"[{session_id[:8]}] {question[:60]!r} | {steps} | total:{latency_ms}ms | conf:{entry['confidence']}")
 
 
+def log_answer(session_id: str, question: str, final_state: dict, latency_ms: int):
+    """
+    Write the full answer to answer_log.jsonl with pipeline version tag.
+    Allows before/after comparison when pipeline parameters change.
+    Each entry includes PIPELINE_VERSION so different runs are distinguishable.
+    """
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "pipeline_version": PIPELINE_VERSION,
+        "session_id": session_id,
+        "question": question,
+        "answer": final_state.get("answer", ""),
+        "reasoning": final_state.get("reasoning", ""),
+        "suggested_action": final_state.get("suggested_action", ""),
+        "confidence_score": round(final_state.get("confidence_score", 0.0), 3),
+        "confidence_factors": final_state.get("confidence_factors", {}),
+        "intent": final_state.get("intent", ""),
+        "query_type": final_state.get("query_type", ""),
+        "citation_ids": [
+            c.get("ticket_id") for c in (final_state.get("citations") or []) if c.get("ticket_id")
+        ],
+        "latency_ms": latency_ms,
+    }
+    with open(ANSWER_LOG_FILE, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 # Routes registered under both / and /api so dev proxy and prod build both work
 
@@ -108,7 +143,10 @@ async def query(
     initial_state = {
         "question": request.question,
         "session_id": request.session_id,
-        # chat_history intentionally omitted — LangGraph MemorySaver preserves it across turns
+        # chat_history populated from frontend's prior_context so multi-turn works even after
+        # server restarts (MemorySaver is RAM-only and gets wiped on every uvicorn reload).
+        # Frontend sends the last ~3 Q&A turns it has stored in localStorage.
+        "chat_history": request.prior_context,
         "metadata_filters": request.metadata_filters,
         "retry_count": 0,
         "injected_context": None,
@@ -166,6 +204,7 @@ async def query(
         yield f"data: {json.dumps(metadata)}\n\n"
 
         log_query(request.session_id, request.question, final_state, latency_ms)
+        log_answer(request.session_id, request.question, final_state, latency_ms)
         log_query_cost(
             session_id=request.session_id,
             question=request.question,
